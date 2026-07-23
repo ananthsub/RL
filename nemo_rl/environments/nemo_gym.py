@@ -261,6 +261,35 @@ Depending on your data shape, you may want to change these values."""
         timer = Timer()
 
         timer.start("_run_rollouts_total")
+
+        # Correlate each rollout so the Gym model server captures its model calls under a stable id,
+        # and resolve the token-capture dirs so we can rebuild a token-bearing response for training.
+        # NeMo Gym's low-level run_examples (unlike its rollout_collection) does not stamp the
+        # task/rollout indices; without them an external harness's model calls reach the model server
+        # uncorrelated (no /ng-rollout prefix) and nothing is captured. Stamp them here.
+        from nemo_gym.base_responses_api_model import maybe_rollout_id_from_run_body
+        from nemo_gym.global_config import ROLLOUT_INDEX_KEY_NAME, TASK_INDEX_KEY_NAME
+        from nemo_gym.token_id_capture import (
+            TokenCaptureStore,
+            token_id_capture_dirs_from_config,
+            trajectories_for_rollout,
+        )
+
+        # The Gym global config (with token_id_capture_*) is carried under
+        # ``initial_global_config_dict`` (grpo.py maps env.nemo_gym there), not self.cfg's top level.
+        token_capture_dirs = token_id_capture_dirs_from_config(
+            self.cfg.get("initial_global_config_dict") or {}
+        )
+        # A monotonic counter gives each rollout a globally-unique id; the per-step ``_rowidx`` resets
+        # every step and would collide token files across steps. The agent derives the same id from
+        # these fields on the /run body, so capture and rebuild agree.
+        if not hasattr(self, "_rollout_seq"):
+            self._rollout_seq = 0
+        for row in nemo_gym_examples:
+            row[TASK_INDEX_KEY_NAME] = self._rollout_seq
+            row[ROLLOUT_INDEX_KEY_NAME] = 0
+            self._rollout_seq += 1
+
         max_attempts, trial = self.rollout_max_attempts_to_avoid_lp_nan, 0
         while trial < max_attempts:
             nemo_gym_num_rows = len(nemo_gym_examples)
@@ -273,6 +302,35 @@ Depending on your data shape, you may want to change these values."""
             for task in nemo_gym_result_iterator:
                 with timer.time(label=f"{timer_prefix}/await_results"):
                     nemo_gym_row, nemo_gym_result = await task
+
+                # External-harness path: the harness's returned output carries no token ids. Rebuild
+                # the training-facing response.output from this rollout's captured model calls so the
+                # postprocess below sees token-bearing assistant items. No-op when capture is off or
+                # nothing was captured (e.g. a native agent already returning inline token ids).
+                if token_capture_dirs and isinstance(
+                    nemo_gym_result.get("response"), dict
+                ):
+                    rollout_id = maybe_rollout_id_from_run_body(nemo_gym_row)
+                    if rollout_id is not None:
+                        built = trajectories_for_rollout(
+                            rollout_id,
+                            token_capture_dirs,
+                            reward=float(nemo_gym_result.get("reward") or 0.0),
+                            model=str(nemo_gym_result["response"].get("model") or ""),
+                        )
+                        if built is not None:
+                            nemo_gym_result["response"]["output"] = built[
+                                "nemo_rl_response"
+                            ]["output"]
+                        # Delete on consume: the tokens are now folded into response.output, so drop
+                        # this rollout's per-rollout capture file(s). Rollouts can each write hundreds
+                        # of KB, so keeping them would grow the capture dir without bound over a run.
+                        # (Set NG_KEEP_TOKCAP=1 to retain them for debugging.)
+                        if not os.environ.get("NG_KEEP_TOKCAP"):
+                            for capture_dir in token_capture_dirs:
+                                TokenCaptureStore(capture_dir).path_for(
+                                    rollout_id
+                                ).unlink(missing_ok=True)
 
                 with timer.time(label=f"{timer_prefix}/postprocess_results"):
                     nemo_rl_result = self._postprocess_nemo_gym_to_nemo_rl_result(
@@ -484,3 +542,12 @@ def setup_nemo_gym_config(config, tokenizer) -> None:
     # Stop strings or token ids are not supported
     generation_config["stop_strings"] = None
     generation_config["stop_token_ids"] = None
+
+    # Publish this trainer's generation sampling params to NeMo Gym through generic config keys so the
+    # Gym model server can force on-policy sampling regardless of what an external harness requests.
+    # Gym holds no NeMo-RL-specific knowledge; it only reads these keys (see the model server's
+    # sampling_overrides). The vLLM generation worker asserts requests match this config, so pinning
+    # here keeps captured rollouts on-policy.
+    nemo_gym_cfg = config.env["nemo_gym"]
+    nemo_gym_cfg["policy_generation_temperature"] = generation_config["temperature"]
+    nemo_gym_cfg["policy_generation_top_p"] = generation_config["top_p"]
