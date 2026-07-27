@@ -25,6 +25,7 @@ into a shard's merge is opaque Gym config, and validation compares entry
 import math
 import re
 from dataclasses import dataclass, field
+from pathlib import PurePosixPath
 from typing import Any, Mapping
 
 from omegaconf import OmegaConf
@@ -40,6 +41,11 @@ SHARDING_CONFIG_KEYS = frozenset(
 
 DEFAULT_REPLICAS = 1
 SHARD_NAME_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]*$")
+
+# Gym's log-directory key (``nemo_gym.global_config.NEMO_GYM_LOG_DIR_KEY_NAME``).
+# Restated rather than imported: this module is imported on the driver, and
+# nemo_gym is installed only in the actor's venv.
+GYM_LOG_DIR_KEY = "nemo_gym_log_dir"
 
 # Per-shard keys consumed by NeMo RL rather than forwarded to Gym.
 SHARD_SPEC_KEYS = frozenset(
@@ -293,3 +299,33 @@ def apply_shard_overlay(
         merged["port_range_low"] = shard.port_range_low
         merged["port_range_high"] = shard.port_range_high
     return merged
+
+
+def apply_shard_log_dir(
+    gym_config: Mapping[str, Any],
+    shard_name: str,
+    *,
+    replica_index: int | None = None,
+) -> dict[str, Any]:
+    """Give one shard instance its own subdirectory of the configured log dir.
+
+    Gym names each server's log file after the server and appends to it with
+    ``tee -a`` (``cli/setup_command.py``). One log dir shared by every instance
+    therefore interleaves output whenever two instances host the same server
+    name — which replicas always do, since they are stamped from one merge — and
+    on shared storage that happens across nodes without any error.
+
+    Returns the config unchanged when no log dir is set, which is the default.
+    """
+    config = dict(gym_config)
+    log_dir = config.get(GYM_LOG_DIR_KEY)
+    if not log_dir:
+        return config
+
+    # Gym applies the same sanitization to server names before using them as
+    # path components.
+    suffix = shard_name.replace("/", "_")
+    if replica_index is not None:
+        suffix = f"{suffix}/{replica_index}"
+    config[GYM_LOG_DIR_KEY] = str(PurePosixPath(str(log_dir)) / suffix)
+    return config
