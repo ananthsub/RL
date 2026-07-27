@@ -521,16 +521,35 @@ class AsyncNemoGymRolloutImpl:
         # would break any verifier that scores a group against itself.
         shard_set = as_nemo_gym_shard_set(self._task_to_env["nemo_gym"])
         nemo_gym_env = shard_set.pick_handle(inputs[0]["agent_ref"]["name"])
+        instance_label = shard_set.instance_label(nemo_gym_env)
+        instance_timer_prefix = f"{timer_prefix}/shard/{instance_label}"
 
         # Run generation and restore input order as results stream back.
         with timer.time(f"{timer_prefix}/run_rollouts"):
             results: list[dict | None] = [None for _ in inputs]
             received_row_indices: set[int] = set()
             env_timing_metrics: dict[str, Any] = {}
-            async for result_ref in nemo_gym_env.run_rollouts.options(
-                num_returns="streaming"
-            ).remote(inputs, self._tokenizer, timer_prefix):
-                rowidx, result, timing_metrics = await result_ref
+            try:
+                stream = nemo_gym_env.run_rollouts.options(
+                    num_returns="streaming"
+                ).remote(inputs, self._tokenizer, instance_timer_prefix)
+            except Exception as error:
+                raise RuntimeError(
+                    f"NeMo-Gym instance '{instance_label}' failed to start "
+                    f"rollout collection: {error}"
+                ) from error
+            iterator = stream.__aiter__()
+            while True:
+                try:
+                    result_ref = await anext(iterator)
+                    rowidx, result, timing_metrics = await result_ref
+                except StopAsyncIteration:
+                    break
+                except Exception as error:
+                    raise RuntimeError(
+                        f"NeMo-Gym instance '{instance_label}' failed during "
+                        f"rollout collection: {error}"
+                    ) from error
                 if not isinstance(rowidx, int) or not 0 <= rowidx < len(inputs):
                     raise ValueError(
                         f"NeMo-Gym returned invalid row index {rowidx!r} for "
@@ -564,6 +583,7 @@ class AsyncNemoGymRolloutImpl:
             )
 
         rollout_metrics.update(env_timing_metrics)
+        rollout_metrics[f"{timer_prefix}/routing/groups/{instance_label}"] = 1
 
         return completions, prompt_message_log, rollout_metrics
 
