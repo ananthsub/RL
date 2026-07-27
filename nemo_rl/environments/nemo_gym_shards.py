@@ -36,9 +36,20 @@ from omegaconf import OmegaConf
 # top-level keys as server instance configs, which can trip its
 # error_on_almost_servers path.
 SHARDING_CONFIG_KEYS = frozenset(
-    {"shards", "common_overrides", "allowed_duplicate_entries"}
+    {
+        "shards",
+        "common_overrides",
+        "allowed_duplicate_entries",
+        "placement_strategy",
+    }
 )
 
+# Ray placement-group strategies a shard plan may ask for. STRICT_SPREAD is the
+# point of sharding -- one actor per node -- and anything else colocates shards
+# and gives up the capacity isolation. PACK exists so the mechanism can be
+# exercised on a single machine.
+PLACEMENT_STRATEGIES = frozenset({"STRICT_SPREAD", "SPREAD", "STRICT_PACK", "PACK"})
+DEFAULT_PLACEMENT_STRATEGY = "STRICT_SPREAD"
 DEFAULT_REPLICAS = 1
 SHARD_NAME_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]*$")
 
@@ -93,6 +104,7 @@ class ShardPlan:
     shards: list[ShardSpec]
     common_overrides: dict[str, Any] = field(default_factory=dict)
     allowed_duplicate_entries: frozenset[str] = frozenset()
+    placement_strategy: str = DEFAULT_PLACEMENT_STRATEGY
 
     @property
     def total_instances(self) -> int:
@@ -235,10 +247,15 @@ def parse_shard_plan(nemo_gym_config: Mapping[str, Any]) -> ShardPlan | None:
     # top-level config_paths or entry overlay could plausibly belong to one
     # shard or to all of them, and guessing wrong silently changes what each
     # actor hosts.
-    if "config_paths" in nemo_gym_config:
+    # A null reads as absent throughout this block. A sharded config is
+    # normally written as a Hydra override of an unsharded recipe, and an
+    # override can only blank an inherited key, never delete it -- so
+    # `config_paths: null` is how one says "the shards own the paths now".
+    if nemo_gym_config.get("config_paths") is not None:
         raise ShardConfigError(
             "env.nemo_gym.config_paths cannot be combined with 'shards'. "
-            "Move each path into the shard that should host it."
+            "Move each path into the shard that should host it, and set the "
+            "inherited config_paths to null."
         )
     stray_entries = find_gym_config_entries(nemo_gym_config)
     if stray_entries:
@@ -261,6 +278,45 @@ def parse_shard_plan(nemo_gym_config: Mapping[str, Any]) -> ShardPlan | None:
     if duplicate_names:
         raise ShardConfigError(f"Duplicate shard names: {duplicate_names}")
 
+    configured_strategy = nemo_gym_config.get("placement_strategy")
+    placement_strategy = (
+        DEFAULT_PLACEMENT_STRATEGY
+        if configured_strategy is None
+        else configured_strategy
+    )
+    if placement_strategy not in PLACEMENT_STRATEGIES:
+        raise ShardConfigError(
+            f"env.nemo_gym.placement_strategy must be one of "
+            f"{sorted(PLACEMENT_STRATEGIES)}, got {placement_strategy!r}"
+        )
+
+    if placement_strategy != DEFAULT_PLACEMENT_STRATEGY:
+        missing_ranges = [
+            shard.name for shard in shards if shard.port_range_low is None
+        ]
+        if missing_ranges:
+            raise ShardConfigError(
+                f"Shards {missing_ranges} require explicit port_range_low/high "
+                f"with placement_strategy {placement_strategy!r}, because relaxed "
+                "placement can colocate shard stacks on one node."
+            )
+        ranges: list[tuple[int, int, str]] = []
+        for shard in shards:
+            assert shard.port_range_low is not None
+            assert shard.port_range_high is not None
+            ranges.append((shard.port_range_low, shard.port_range_high, shard.name))
+        ranges.sort()
+        for (_, previous_high, previous_name), (
+            current_low,
+            _,
+            current_name,
+        ) in zip(ranges, ranges[1:]):
+            if current_low < previous_high:
+                raise ShardConfigError(
+                    f"Shards '{previous_name}' and '{current_name}' have "
+                    "overlapping port ranges under relaxed placement"
+                )
+
     raw_allowed = nemo_gym_config.get("allowed_duplicate_entries") or []
     if OmegaConf.is_config(raw_allowed):
         raw_allowed = OmegaConf.to_container(raw_allowed, resolve=True)
@@ -277,6 +333,7 @@ def parse_shard_plan(nemo_gym_config: Mapping[str, Any]) -> ShardPlan | None:
             nemo_gym_config.get("common_overrides"), context="common_overrides"
         ),
         allowed_duplicate_entries=frozenset(raw_allowed),
+        placement_strategy=placement_strategy,
     )
 
 
@@ -288,6 +345,11 @@ def apply_shard_overlay(
     The ``config_paths`` merge itself still happens inside Gym, exactly as for
     an unsharded job; this only settles which paths and overlays that shard
     starts from. Per-shard overrides win over ``common_overrides`` on conflict.
+
+    Top-level keys left null are dropped rather than forwarded. Blanking a key
+    is the only way a Hydra override can retract one it inherited (see
+    ``parse_shard_plan``), and Gym should not receive a null where it expects
+    an entry.
     """
     merged = OmegaConf.to_container(
         OmegaConf.merge(
@@ -298,6 +360,7 @@ def apply_shard_overlay(
         resolve=True,
     )
     assert isinstance(merged, dict)
+    merged = {key: value for key, value in merged.items() if value is not None}
     merged["config_paths"] = list(shard.config_paths)
     if shard.port_range_low is not None:
         merged["port_range_low"] = shard.port_range_low
