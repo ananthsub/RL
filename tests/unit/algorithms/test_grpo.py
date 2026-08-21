@@ -199,6 +199,108 @@ def test_native_prompt_grouping_uses_prompt_tokens() -> None:
     assert grouping_ids is prompt_token_ids
 
 
+def test_nemo_gym_prompt_grouping_offsets_keep_generation_batches_distinct() -> None:
+    first = _prompt_grouping_ids(
+        None,
+        num_prompts=2,
+        num_generations_per_prompt=2,
+        use_nemo_gym=True,
+    )
+    second = _prompt_grouping_ids(
+        None,
+        num_prompts=2,
+        num_generations_per_prompt=2,
+        use_nemo_gym=True,
+        base_group_index=2,
+    )
+
+    assert torch.equal(second, torch.tensor([[2], [2], [3], [3]]))
+    # Rows from different generation batches must never share a group id:
+    # dynamic sampling can put both batches into one training batch.
+    assert torch.cat([first, second]).unique().numel() == 4
+
+
+def test_prompt_grouping_ids_ride_through_dynamic_sampling() -> None:
+    """Rows kept by dynamic sampling keep their group identity, including rows
+    accumulated from an earlier generation batch via the batch cache."""
+
+    def gen_batch(base: int) -> BatchedDataDict:
+        return BatchedDataDict(
+            {
+                "idx": torch.arange(4),
+                "total_reward": torch.tensor([1.0, 0.0, 0.5, 0.5]),
+                "prompt_grouping_ids": torch.tensor(
+                    [[base], [base], [base + 1], [base + 1]]
+                ),
+            }
+        )
+
+    master_config = MagicMock()
+    master_config.grpo.use_dynamic_sampling = True
+    master_config.grpo.num_prompts_per_step = 2
+    master_config.grpo.num_generations_per_prompt = 2
+    master_config.grpo.dynamic_sampling_max_gen_batches = 8
+    master_config.grpo.deduplicate_multimodal_data = False
+
+    # Batch 0: only group 0 (rows 0-1) has non-zero std.
+    _, complete, cache, _ = dynamic_sampling(
+        gen_batch(base=0),
+        torch.tensor([1.0, 1.0, 0.0, 0.0]),
+        torch.zeros(4),
+        1,
+        master_config,
+        MagicMock(),
+        None,
+    )
+    assert not complete
+
+    # Batch 1 (ids offset by the two prompts already dispatched): only group 3
+    # (rows 2-3) has non-zero std; merged with the cache this fills the step.
+    filtered, complete, _, _ = dynamic_sampling(
+        gen_batch(base=2),
+        torch.tensor([0.0, 0.0, 1.0, 1.0]),
+        torch.zeros(4),
+        2,
+        master_config,
+        MagicMock(),
+        cache,
+    )
+    assert complete
+    assert torch.equal(
+        filtered["prompt_grouping_ids"], torch.tensor([[0], [0], [3], [3]])
+    )
+    # Alignment: each surviving row still pairs with its own original data.
+    assert torch.equal(filtered["idx"], torch.tensor([0, 1, 2, 3]))
+
+
+def test_grpo_estimator_needs_grouping_ids_when_prompt_bytes_differ() -> None:
+    """The regression behind carrying grouping ids to the estimator: a harness
+    that rewrites the prompt per rollout (e.g. a unique workspace path) makes
+    byte-identity grouping produce singleton groups, which destroys the
+    baseline. Positional grouping ids recover the true groups."""
+    estimator = GRPOAdvantageEstimator(
+        AdvEstimatorConfig(normalize_rewards=False, use_leave_one_out_baseline=True),
+        loss_config=MagicMock(),
+    )
+    rewards = torch.tensor([1.0, 0.0, 1.0, 0.0])
+    mask = torch.ones(4, 3)
+
+    # Two prompts x two generations, but every rollout's prompt bytes are unique.
+    unique_prompt_bytes = torch.tensor([[10, 1], [10, 2], [20, 1], [20, 2]])
+    broken = estimator.compute_advantage(
+        prompt_ids=unique_prompt_bytes, rewards=rewards, mask=mask
+    )
+
+    grouping_ids = torch.tensor([[0], [0], [1], [1]])
+    fixed = estimator.compute_advantage(
+        prompt_ids=grouping_ids, rewards=rewards, mask=mask
+    )
+
+    expected = torch.tensor([1.0, -1.0, 1.0, -1.0]).unsqueeze(-1).expand(mask.shape)
+    assert torch.equal(fixed, expected)
+    assert not torch.allclose(broken, expected)
+
+
 def test_initial_policy_generation_stale() -> None:
     generation = MagicMock()
     generation.weight_synchronizer.is_stale = False
