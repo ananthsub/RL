@@ -62,26 +62,27 @@ Check every box before proceeding.
 - [ ] `WANDB_API_KEY` (or flip `logger.wandb_enabled: false` in the config).
 - [ ] `SLURM_ACCOUNT` and `SLURM_PARTITION` values for your cluster.
 
-### 1.2 The one unpushed dependency (resolve before anything else)
+### 1.2 The Gym side: upstream/main, pinned
 
-The Gym side of this experiment is the branch `stack-v2-fixes`
-(tip `86227cd10`, "terminal join is corroborating witnesses"). As of
-2026-08-30 it exists **only** as the local worktree `~/dev/Gym-stack-v2` on
-Ananth's machine — it is not on any remote.
+The Gym capture stack (PRs 2180/2181 and successors) is **merged to
+NVIDIA-NeMo/Gym `main`**. Verified against upstream/main at `1a12168c0`
+(2026-08-30): the full `nemo_gym/token_id_capture/` module (including
+`delivery.py`, `lineage.py`, `fingerprint.py`, `terminal.py`), every symbol
+this RL branch imports at identical module paths and signatures
+(`finalize_rollout_token_capture`, `retire_rollout_token_capture`,
+`token_id_capture_enabled_for_agent`, `clear_token_captures_for_rollouts`,
+`TokenCaptureStore`, `TokenSource`, `TokenIdCaptureConfig`,
+`token_id_capture_dirs_from_config`), the unchanged
+`TokenIdCaptureSettings` yaml schema, `vllm_model_supply_prefix.yaml`,
+`vllm_model_for_training.yaml`, and the `reasoning_gym_*_model_server` agent
+configs. `nemo_gym/cli/__init__.py` upstream even keeps a lazy re-export table
+specifically so NeMo-RL's `RunHelper` / `GlobalConfigDictParserConfig` imports
+stay stable.
 
-- If you are on that machine: fetch from the worktree path (commands in §2.2).
-- If you are anywhere else: someone must first push it, e.g.
-  `git -C ~/dev/Gym-stack-v2 push origin stack-v2-fixes:ananthsub/stack-v2-fixes`
-  (origin = github.com/ananthsub/Gym), and you then fetch
-  `ananthsub/stack-v2-fixes` from that fork in §2.2.
-
-Do not substitute Gym `main`, the upstream release, or the
-`session-state-prototype` branch. They are missing
-`nemo_gym/token_id_capture/delivery.py` and
-`token_id_capture_enabled_for_agent`, which the RL branch imports at rollout
-time, and missing `vllm_model_supply_prefix.yaml`. The failure mode is an
-`ImportError` inside `NemoGym.run_rollouts` after you have already burned
-cluster spin-up time.
+Use upstream/main **pinned at `1a12168c0`** (§2.2). A newer main will probably
+also work — the smoke test (§5) is the gate — but `1a12168c0` is the commit
+this runbook's checks were run against. The historical `stack-v2-fixes`
+worktree branch is superseded and no longer needed.
 
 ### 1.3 Node.js on aarch64 (needed for claude_code and codex arms only)
 
@@ -141,19 +142,14 @@ stamping, rebuilt-response substitution, capture metrics, per-shard id
 derivation, record retirement, sampling pinned on the model server, and the
 grouping-id fix for the advantage estimator.
 
-### 2.2 Gym submodule at the capture branch
+### 2.2 Gym submodule at pinned upstream/main
 
 ```bash
 git submodule update --init 3rdparty/Gym-workspace/Gym
 cd 3rdparty/Gym-workspace/Gym
-
-# On Ananth's machine:
-git remote add local ~/dev/Gym-stack-v2 2>/dev/null || true
-git fetch local stack-v2-fixes && git checkout FETCH_HEAD
-
-# Anywhere else (after §1.2 push):
-# git fetch origin ananthsub/stack-v2-fixes && git checkout FETCH_HEAD
-
+git remote add upstream https://github.com/NVIDIA-NeMo/Gym.git 2>/dev/null || true
+git fetch upstream main
+git checkout 1a12168c0   # verified pin, 2026-08-30 (see §1.2)
 cd ../../..
 ```
 
@@ -177,11 +173,11 @@ from nemo_gym.token_id_capture import TokenCaptureStore, TokenIdCaptureConfig
 print('gym capture API: OK')"
 
 # 3. Gym submodule is at the right commit:
-git -C 3rdparty/Gym-workspace/Gym log --oneline -1   # expect 86227cd10 (or newer on that branch)
+git -C 3rdparty/Gym-workspace/Gym log --oneline -1   # expect 1a12168c0
 ```
 
-If check 2 raises `ImportError`, the submodule is on the wrong Gym generation —
-redo §2.2.
+If check 2 raises `ImportError`, the submodule is on the wrong Gym generation
+(e.g. a pre-merge branch or a stale checkout) — redo §2.2.
 
 ---
 
@@ -230,8 +226,23 @@ and append this entry to the existing `datasets:` list (same indentation as the
 `reasoning_gym_claude_code_agent.yaml`, which declares it but is NOT usable for
 training — see the warning below.) Make the same edit to
 `reasoning_gym_codex_agent_model_server.yaml` if you will run the codex arm.
-The hermes config (`math_with_judge_hermes_agent.yaml`) already declares its
-train dataset; no edit needed.
+
+For the hermes arm the config is `environments/hermes_math/config.yaml`
+(agent `hermes_math_agent`; model_server-bound, so capture-correlated). Its
+declared `train` dataset comes from an internal GitLab artifact registry
+(`gitlab_identifier: dapo17k`). If you have that access, no edit is needed —
+`--download` resolves it. Otherwise swap the `train` entry for the public HF
+math dataset:
+
+```yaml
+        - name: train
+          type: train
+          jsonl_fpath: environments/hermes_math/data/OpenMathReasoning_train.jsonl
+          huggingface_identifier:
+            repo_id: nvidia/Nemotron-RL-math-OpenMathReasoning
+            artifact_fpath: train.jsonl
+          license: Creative Commons Attribution 4.0 International
+```
 
 > **Warning — do not collate against the plain (non-`_model_server`) configs.**
 > `reasoning_gym_claude_code_agent.yaml` and `reasoning_gym_codex_agent.yaml`
@@ -256,10 +267,10 @@ gym dataset collate \
     --output-dir data/reasoning_gym_claude_code \
     --mode train_preparation --download +data_source=huggingface
 
-# hermes arm (math_with_judge / OpenMathReasoning):
+# hermes arm (environments/hermes_math -- --config is repeatable and composes):
 gym dataset collate \
     --config responses_api_models/vllm_model/configs/vllm_model_for_training.yaml \
-    --resources-server math_with_judge/math_with_judge_hermes_agent \
+    --config environments/hermes_math/config.yaml \
     --output-dir data/math_hermes \
     --mode train_preparation --download +data_source=huggingface
 
@@ -281,8 +292,8 @@ head -1 $GYM/data/reasoning_gym_claude_code/*.jsonl | python3 -m json.tool | gre
 ```
 
 The `agent_ref` must name `reasoning_gym_claude_code_agent_model_server`
-(hermes rows: `math_with_judge_hermes_agent`). If it names the plain agent, you
-collated against the wrong config — redo §4.1/§4.2.
+(hermes rows: `hermes_math_agent`). If it names a plain/non-model-server agent,
+you collated against the wrong config — redo §4.1/§4.2.
 
 Then set the data paths. The shipped config points at:
 
@@ -445,7 +456,7 @@ is a required field already set in that config. Needs Node (§1.3).
 In `config_paths`, replace the claude_code line with:
 
 ```yaml
-    - resources_servers/math_with_judge/configs/math_with_judge_hermes_agent.yaml
+    - environments/hermes_math/config.yaml
 ```
 
 and repoint the data:
@@ -467,6 +478,12 @@ Hermes specifics:
 - Hermes injects `chat_template_kwargs: {enable_thinking: true,
   truncate_history_thinking: false}` on every chat-completions call. Inert on
   Instruct-2507; on the thinking arm it composes with the reasoning parser.
+- Uniform-environment alternative: `environments/hermes_reasoning_gym/config.yaml`
+  is also model_server-bound, putting all three harnesses on reasoning_gym.
+  Its declared train jsonl is a local knights-knaves file — add the §4.1 HF
+  reasoning-gym block (adjust `jsonl_fpath` to that environment's `data/` dir)
+  or generate data with `environments/hermes_reasoning_gym/prepare.py`, then
+  collate as usual.
 
 ### 7.4 If you are on 8-GPU x86 nodes instead of GB200
 
@@ -550,6 +567,17 @@ All emitted by the NemoGym actor alongside timing metrics.
   the CLI process. A restart re-runs the rollout from scratch. This experiment
   does not involve the session-state checkpointing prototype.
 - `opencode_sandboxed_agent` applies no rollout prefix at all — not usable here.
+- **Not every `environments/` wiring is capture-ready.** Upstream's reorg
+  (Gym #2151) added per-harness environments, but only some bind
+  `model_server: policy_model` (required for the rollout prefix and capture):
+  `hermes_math`, `hermes_reasoning_gym`, and `claude_code_math` are
+  capture-wired; `claude_code_reasoning_gym` binds `anthropic_base_url`
+  directly, and `codex_math`/`codex_reasoning_gym` bind `openai_base_url`
+  directly — none of those three apply the prefix, so nothing is captured.
+  For claude_code and codex on reasoning_gym, use the
+  `resources_servers/reasoning_gym/configs/*_model_server.yaml` configs as this
+  runbook does. (`claude_code_math` is a valid optional math arm for claude,
+  same gitlab-vs-HF dataset choice as hermes_math.)
 
 ---
 

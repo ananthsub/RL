@@ -22,10 +22,10 @@
 #   - NeMo RL branch grpo-grouping-through-dynamic-sampling (or the pr-3407 stack):
 #     nemo_rl/environments/nemo_gym.py imports nemo_gym.token_id_capture.delivery
 #     and token_id_capture_enabled_for_agent.
-#   - Gym checked out at the 2180/2181 generation (local: ~/dev/Gym-stack-v2
-#     branch stack-v2-fixes) inside 3rdparty/Gym-workspace/Gym -- the branch that
-#     has delivery.py, lineage.py, and vllm_model_supply_prefix.yaml. The
-#     session-state-prototype branch does NOT have these.
+#   - Gym at upstream/main, pinned 1a12168c0 (verified 2026-08-30), inside
+#     3rdparty/Gym-workspace/Gym -- the capture stack (delivery.py, lineage.py,
+#     vllm_model_supply_prefix.yaml) is merged to NVIDIA-NeMo/Gym main. See
+#     RUNBOOK.md section 2.2 for the checkout commands.
 #
 # Launch (login node, from the NeMo RL root on shared FS):
 #   export GYM_ROOT=$PWD/3rdparty/Gym-workspace/Gym
@@ -179,7 +179,7 @@ env:
     # the /ng-rollout/<id>/training-token-capture prefix). Swap this line for
     # the codex or hermes arm:
     #   resources_servers/reasoning_gym/configs/reasoning_gym_codex_agent_model_server.yaml
-    #   resources_servers/math_with_judge/configs/math_with_judge_hermes_agent.yaml
+    #   environments/hermes_math/config.yaml
     - resources_servers/reasoning_gym/configs/reasoning_gym_claude_code_agent_model_server.yaml
     # Prefix supply ON (B arm): the model server hands vLLM the previous call's
     # exact tokens instead of re-rendering the conversation through the chat
