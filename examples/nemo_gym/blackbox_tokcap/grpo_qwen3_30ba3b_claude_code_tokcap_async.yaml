@@ -1,0 +1,219 @@
+# Async GRPO + blackbox CLI harness (Claude Code) + token-id capture + prefix supply.
+# Qwen3-30B-A3B-Instruct-2507 on reasoning_gym.
+# Sized for GB200 (4 GPUs/node, aarch64): 8 nodes = 4 train + 4 generation.
+#
+# GB200 NOTES:
+#   - CONTAINER_IMAGE_PATH must be the aarch64 build of the NeMo RL nightly.
+#   - claude_code/codex setup scripts hardcode linux-x64 Node tarballs
+#     (setup_claude_code.py:29, setup_codex.py:29, claude_code_agent_deps.sh:19).
+#     On Grace they only work if `node`/`npm` are already on PATH (the setup
+#     returns early via shutil.which) -- bake an arm64 Node into the container
+#     or a mounted deps dir, or patch the URLs to linux-arm64.
+#   - hermes_agent is pure Python (no Node) -- easiest arm on GB200.
+#
+# Inherits the proven 30B MoE model config (megatron TP4/EP8/CP2, hermes tool
+# parser) from grpo_qwen3_30ba3b_instruct.yaml and swaps in:
+#   - async GRPO (non-colocated generation -- async_grpo_train asserts this)
+#   - the claude_code agent bound to the Gym model server, on reasoning_gym
+#   - token_id_capture (file store) so the CLI's calls are captured + rebuilt
+#   - prefix supply (comment that config_path out for the A arm of an A/B)
+#
+# REQUIRES (see the session notes):
+#   - NeMo RL branch grpo-grouping-through-dynamic-sampling (or the pr-3407 stack):
+#     nemo_rl/environments/nemo_gym.py imports nemo_gym.token_id_capture.delivery
+#     and token_id_capture_enabled_for_agent.
+#   - Gym checked out at the 2180/2181 generation (local: ~/dev/Gym-stack-v2
+#     branch stack-v2-fixes) inside 3rdparty/Gym-workspace/Gym -- the branch that
+#     has delivery.py, lineage.py, and vllm_model_supply_prefix.yaml. The
+#     session-state-prototype branch does NOT have these.
+#
+# Launch (login node, from the NeMo RL root on shared FS):
+#   export GYM_ROOT=$PWD/3rdparty/Gym-workspace/Gym
+#   WANDB_API_KEY=... HF_TOKEN=... EXP_NAME=cc-tokcap-async \
+#   NUM_ACTOR_NODES=8 REPO_LOCATION=$PWD \
+#   CONTAINER_IMAGE_PATH=/path/to/nemo-rl-nightly-aarch64.sqsh \
+#   SLURM_ACCOUNT=... SLURM_PARTITION=... \
+#   bash examples/nemo_gym/launch_nemo_gym_multinode_training.sh \
+#     --config examples/nemo_gym/blackbox_tokcap/grpo_qwen3_30ba3b_claude_code_tokcap_async.yaml
+#
+# Environment the job needs (put in the launch command / sbatch env):
+#   RAY_TMPDIR=/tmp                       # Lustre paths overflow AF_UNIX socket limit
+#   RAY_ENABLE_UV_RUN_RUNTIME_ENV=0
+#   CLAUDE_CODE_MAX_OUTPUT_TOKENS=4096    # bound per-call output from the CLI
+#   GYM_ROOT=<REPO_LOCATION>/3rdparty/Gym-workspace/Gym
+#
+# PASS (watch these in the logger):
+#   token_capture/rebuilt_fraction == 1.0     every rollout produced a trajectory
+#   token_capture/calls_per_rollout_mean > 1  the CLI actually called tools
+#   token_capture/parent_link_failures == 0
+#   prefix supply: non-zero supplied count in the Gym model server log
+#   non-zero grad_norm each step
+
+defaults: "../grpo_qwen3_30ba3b_instruct.yaml"
+
+checkpointing:
+  checkpoint_dir: results/grpo-qwen3-30ba3b-claude-code-tokcap
+  metric_name: "train:total_reward/mean"
+  higher_is_better: true
+  keep_top_k: 2
+  save_period: 5
+  checkpoint_must_save_by: "00:03:30:00"
+
+grpo:
+  # Blackbox CLI rollouts are slow (each one is a whole Claude Code session).
+  # Start small; scale prompts-per-step only after step time is understood.
+  num_prompts_per_step: 64
+  num_generations_per_prompt: 8
+  max_rollout_turns: 1 # the CLI runs its own multi-turn loop; RL sees one rollout per prompt
+  max_num_epochs: 100
+  val_period: 1000
+  val_at_start: false
+  val_batch_size: 256
+  async_grpo:
+    enabled: true
+    max_trajectory_age_steps: 1
+    max_generation_failures: 3
+    in_flight_weight_updates: true
+
+# Async needs importance-sampling correction; these mirror the settings the
+# async 30B swe recipes run with (token-level GRPO + TIS, not GSPO).
+loss_fn:
+  kl_input_clamp_value: null
+  kl_output_clamp_value: null
+  ratio_clip_min: 0.2
+  ratio_clip_max: 0.28
+  use_on_policy_kl_approximation: true
+  use_importance_sampling_correction: true
+  truncated_importance_sampling_type: tis
+  truncated_importance_sampling_ratio: 5.0
+  truncated_importance_sampling_ratio_min: null
+  sequence_level_importance_ratios: false
+  token_level_loss: true
+  force_on_policy_ratio: false
+  use_kl_in_reward: false
+
+policy:
+  # Non-thinking variant first: no reasoning parser, no template surgery, and the
+  # validated 3B claude_code recipe shape carries over directly. Switch to
+  # Qwen/Qwen3-30B-A3B-Thinking-2507 (+ reasoning_parser: deepseek_r1) for the
+  # arm where prefix supply is load-bearing (its template strips prior-turn
+  # thinking on re-render).
+  model_name: Qwen/Qwen3-30B-A3B-Instruct-2507
+  train_global_batch_size: 512
+  # Claude Code's system prompt + tool definitions are the fixed per-call cost;
+  # 32k leaves room for the conversation the CLI accumulates.
+  max_total_sequence_length: 32768
+  logprob_chunk_size: 2048
+  offload_optimizer_for_logprob: true
+
+  # GB200: 4 GPUs per node. TP4 = one node per model replica; DP = train nodes.
+  # Parent recipe's EP8/CP2 assumed 8-GPU nodes: EP4 keeps expert comms
+  # intra-node (128 experts -> 32/GPU, fine in 186GB HBM), CP1 is enough at 32k
+  # on B200 (raise CP + drop TP if activations OOM). Constraint: TP*DP must be
+  # divisible by expert_model_parallel_size -- holds for any train-node count.
+  megatron_cfg:
+    tensor_model_parallel_size: 4
+    expert_model_parallel_size: 4
+    context_parallel_size: 1
+
+  generation:
+    port_range_low: 3000
+    port_range_high: 4999
+    max_new_tokens: ${policy.max_total_sequence_length}
+    vllm_cfg:
+      # REQUIRED by the NeMo Gym path (setup_nemo_gym_config enforces async +
+      # expose_http_server, but skip_tokenizer_init's auto-default resolves
+      # before that and must be pinned -- without a tokenizer every HTTP model
+      # call 500s and the harness generates nothing).
+      async_engine: true
+      skip_tokenizer_init: false
+      enable_prefix_caching: true
+      # TP2 on B200: ~31GB/GPU of weights, huge KV headroom at 32k -> 2 engines
+      # per 4-GPU node, 8 engines across 4 generation nodes.
+      tensor_parallel_size: 2
+      gpu_memory_utilization: 0.8
+      # enable_auto_tools + tool_parser: hermes inherited from the instruct
+      # parent. Without the parser Qwen's <tool_call> text never becomes a
+      # structured tool_call, the Anthropic converter forwards it as plain text,
+      # Claude Code never sees a tool_use block, and every rollout is single-turn.
+    colocated:
+      # async_grpo_train asserts non-colocated inference.
+      enabled: false
+      resources:
+        gpus_per_node: 4 # must equal cluster.gpus_per_node (multi-node non-colocated)
+        num_nodes: 4
+
+data:
+  max_input_seq_length: null
+  shuffle: false
+  num_workers: 1
+  use_multiple_dataloader: false
+  # Materialize with `gym dataset collate` from the Gym checkout (adds agent_ref
+  # per row -- verify it names reasoning_gym_claude_code_agent, not the plain
+  # reasoning_gym agent, or the CLI harness never runs).
+  train:
+    data_path: "${oc.env:GYM_ROOT}/data/reasoning_gym_claude_code/train.jsonl"
+  validation:
+    data_path: "${oc.env:GYM_ROOT}/data/reasoning_gym_claude_code/validation.jsonl"
+  default:
+    dataset_name: NemoGymDataset
+    env_name: "nemo_gym"
+    prompt_file: null
+    system_prompt_file: null
+    processor: "nemo_gym_data_processor"
+  _override_: true
+
+env:
+  should_use_nemo_gym: true
+  should_log_nemo_gym_responses: false
+  # REQUIRED true: a failed token-capture rebuild degrades its own sample via
+  # mask_sample instead of training on a partial rollout.
+  should_mask_flagged_samples: true
+  nemo_gym:
+    skip_venv_if_present: true
+    port_range_low: 5000
+    port_range_high: 5999
+    config_paths:
+    - responses_api_models/vllm_model/configs/vllm_model_for_training.yaml
+    # claude_code harness bound to the Gym model server (ANTHROPIC_BASE_URL gets
+    # the /ng-rollout/<id>/training-token-capture prefix). Swap this line for
+    # the codex or hermes arm:
+    #   resources_servers/reasoning_gym/configs/reasoning_gym_codex_agent_model_server.yaml
+    #   resources_servers/math_with_judge/configs/math_with_judge_hermes_agent.yaml
+    - resources_servers/reasoning_gym/configs/reasoning_gym_claude_code_agent_model_server.yaml
+    # Prefix supply ON (B arm): the model server hands vLLM the previous call's
+    # exact tokens instead of re-rendering the conversation through the chat
+    # template. Comment out for the A arm of the A/B.
+    - responses_api_models/vllm_model/configs/vllm_model_supply_prefix.yaml
+    # The CLI builds its own requests and sends no sampling params; pin the
+    # training profile on the model server it talks to.
+    policy_model:
+      responses_api_models:
+        vllm_model:
+          sampling_overrides:
+            temperature: ${policy.generation.temperature}
+            top_p: ${policy.generation.top_p}
+    # File-store capture (the non-TransferQueue path). Node-local is fine: the
+    # Gym model server and the NemoGym actor that finalizes/retires records are
+    # subprocess and parent on the same node. Use a job-scoped shared-FS path
+    # instead if you want to inspect records after the run.
+    token_id_capture:
+      enabled: true
+      all_agents: true
+      dir: /tmp/ng_tokcap
+      rebuild_response: false
+  _override_: true
+
+logger:
+  log_dir: "logs"
+  wandb_enabled: true
+  wandb:
+    project: "gym-blackbox-tokcap"
+    name: "qwen3-30ba3b-claude-code-tokcap-async"
+
+cluster:
+  gpus_per_node: 4 # GB200: 4 Blackwell GPUs per node
+  # Total. Non-colocated: train_nodes = num_nodes - generation num_nodes (4+4).
+  # Blackbox CLI rollouts are generation-bound: if the async trainer idles,
+  # shift the ratio toward generation (e.g. 3 train + 5 gen) before adding nodes.
+  num_nodes: 8
